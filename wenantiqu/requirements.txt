@@ -1,0 +1,10 @@
+PyQt5
+pandas
+ffmpeg-python
+openai-whisper
+yt-dlp
+imageio-ffmpeg
+playwright
+requests
+huggingface-hub
+numpy

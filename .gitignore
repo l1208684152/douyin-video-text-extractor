@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual env
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 视频/音频/图片文件
+*.mp4
+*.flv
+*.avi
+*.mov
+*.mkv
+*.wav
+*.mp3
+*.m4a
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+
+# Excel 输出
+*.xlsx
+*.xls
+
+# 敏感数据
+cookies.txt
+cookies.json
+auth_status.ini
+ai_config.json
+
+# 日志
+*.log
+
+# 临时文件
+temp/
+tmp/
+*.tmp
+
+# 模型文件
+models/
+
+# 浏览器数据
+douyin_user_data/

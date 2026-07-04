@@ -1,0 +1,50 @@
+# 依赖包
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 环境变量和配置文件
+.env
+auth_status.ini
+
+# 浏览器数据目录
+douyin_user_data/
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# Excel文件
+*.xlsx
+*.xls
+
+# 截图文件
+*.png
+*.jpg
+*.jpeg
+
+# 操作系统文件
+Thumbs.db
+.DS_Store
+
+# 编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 构建文件
+build/
+dist/
+*.egg-info/
+
+# 测试文件
+.pytest_cache/
+
+# Python虚拟环境
+venv/
+env/
