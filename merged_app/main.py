@@ -790,6 +790,12 @@ class CollectThread(QThread):
             # --- 页面信息诊断 ---
             page_title = page.title()
             page_url = page.url
+            # 提取博主名称: "酷盟官方旗舰店的抖音 - 抖音" → "酷盟官方旗舰店"
+            blogger_name = page_title
+            for suffix in ["的抖音 - 抖音", "的抖音—抖音", "的抖音-抖音"]:
+                if suffix in blogger_name:
+                    blogger_name = blogger_name.replace(suffix, "").strip()
+                    break
             self.log_signal.emit(f"[调试] 当前页面标题: {page_title}")
             self.log_signal.emit(f"[调试] 当前页面 URL: {page_url}")
 
@@ -877,6 +883,9 @@ class CollectThread(QThread):
 
                     collected.append({
                         "序号": len(collected) + 1,
+                        "博主名称": blogger_name,
+                        "博主页面标题": page_title,
+                        "博主页面URL": page_url,
                         "视频标题": title[:100],
                         "完整标题": full_title[:200],
                         "话题标签": tags_str,
