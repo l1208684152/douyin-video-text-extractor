@@ -1,8 +1,0 @@
-# 核心依赖
-playwright==1.45.0
-pandas==2.2.2
-openpyxl==3.1.5
-requests==2.32.3
-
-# 可选依赖
-wmi==1.5.1  # 仅Windows系统需要，用于获取设备ID
