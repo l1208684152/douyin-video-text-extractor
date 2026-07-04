@@ -127,6 +127,7 @@ class BrowserDownloadThread(QThread):
     def run(self):
         downloaded = []
         total = len(self.video_urls)
+        max_retries = 3
         if not PLAYWRIGHT_AVAILABLE:
             self.progress_signal.emit(0, "Playwright 未安装，尝试使用 yt-dlp...")
             self._use_ytdlp_fallback()
@@ -135,17 +136,31 @@ class BrowserDownloadThread(QThread):
         for i, url in enumerate(self.video_urls):
             if self.abort:
                 break
-            try:
-                self.progress_signal.emit(int((i + 1) / total * 100), f"正在处理第 {i+1} 个视频...")
-                video_path = self._download_one(url, i)
-                downloaded.append((url, video_path))
-                if video_path:
-                    self.progress_signal.emit(int((i + 1) / total * 100), f"第 {i+1} 个下载成功")
-                else:
-                    self.progress_signal.emit(int((i + 1) / total * 100), f"第 {i+1} 个下载失败")
-            except Exception as e:
-                self.progress_signal.emit(int((i + 1) / total * 100), f"错误: {str(e)[:80]}")
+            video_path = None
+            for attempt in range(1, max_retries + 1):
+                if self.abort:
+                    break
+                try:
+                    self.progress_signal.emit(int((i + 1) / total * 100),
+                        f"正在处理第 {i+1} 个视频{f'(重试 {attempt}/{max_retries})' if attempt > 1 else ''}...")
+                    video_path = self._download_one(url, i)
+                    if video_path:
+                        downloaded.append((url, video_path))
+                        self.progress_signal.emit(int((i + 1) / total * 100), f"第 {i+1} 个下载成功")
+                        break
+                    elif attempt < max_retries:
+                        delay = 2 ** attempt
+                        self.progress_signal.emit(int((i + 1) / total * 100),
+                            f"第 {i+1} 个下载失败，{delay}s 后重试...")
+                        time.sleep(delay)
+                except Exception as e:
+                    if attempt < max_retries:
+                        time.sleep(2 ** attempt)
+                    else:
+                        self.progress_signal.emit(int((i + 1) / total * 100), f"错误: {str(e)[:80]}")
+            if not video_path:
                 downloaded.append((url, None))
+                self.progress_signal.emit(int((i + 1) / total * 100), f"第 {i+1} 个下载失败(已重试{max_retries}次)")
         self.finished_signal.emit(downloaded)
 
     def _download_one(self, url: str, index: int):
@@ -352,18 +367,23 @@ class ExtractAudioThread(QThread):
 
 
 class TranscribeThread(QThread):
-    """语音转文字 — 常驻子进程跑 Whisper，模型只加载一次"""
+    """语音转文字 — 多子进程并行，模型只加载一次，断点续传"""
     progress_signal = pyqtSignal(int, str)
     finished_signal = pyqtSignal(list)
 
-    def __init__(self, audio_files):
+    def __init__(self, audio_files, input_file="", save_file="", workers=0):
         super().__init__()
         self.audio_files = audio_files
+        self.input_file = input_file
+        self.save_file = save_file
         self.abort = False
+        # 自动检测 workers 数量：默认 min(2, CPU/2)
+        import multiprocessing
+        cpu = multiprocessing.cpu_count()
+        self.workers = workers if workers > 0 else min(2, max(1, cpu // 2))
 
     @staticmethod
     def _whisper_worker_script():
-        """子进程执行的脚本 — 加载模型一次，循环处理 stdin 传入的音频路径"""
         return (
             "import sys, json, warnings\n"
             "warnings.filterwarnings('ignore')\n"
@@ -373,91 +393,135 @@ class TranscribeThread(QThread):
             "sys.stderr.write('MODEL_READY\\n')\n"
             "sys.stderr.flush()\n"
             "for line in sys.stdin:\n"
-            "    path = line.strip()\n"
-            "    if path == 'DONE' or not path:\n"
+            "    line = line.strip()\n"
+            "    if line == 'DONE' or not line:\n"
             "        break\n"
+            "    parts = line.split('|', 1)\n"
+            "    task_url = parts[0] if len(parts) > 1 else ''\n"
+            "    path = parts[1] if len(parts) > 1 else line\n"
             "    try:\n"
             "        r = model.transcribe(path, language='zh', fp16=False,"
             "            initial_prompt='请将以下中文语音转换为简体中文文字。')\n"
-            "        print(json.dumps({'ok': True, 'text': r['text'].strip()}, ensure_ascii=False), flush=True)\n"
+            "        print(json.dumps({'url': task_url, 'ok': True, 'text': r['text'].strip()}, ensure_ascii=False), flush=True)\n"
             "    except Exception as e:\n"
-            "        print(json.dumps({'ok': False, 'error': str(e)}, ensure_ascii=False), flush=True)\n"
+            "        print(json.dumps({'url': task_url, 'ok': False, 'error': str(e)}, ensure_ascii=False), flush=True)\n"
         )
 
-    def _transcribe_batch(self, valid_audio):
-        """常驻子进程：一次启动，批量处理所有音频"""
-        total = len(valid_audio)
-        results = {}
+    def _save_progress(self, results):
+        """增量保存识别结果到 Excel"""
+        if not self.save_file or not self.input_file:
+            return
+        try:
+            df = pd.read_csv(self.input_file, encoding='utf-8') if self.input_file.endswith('.csv') else pd.read_excel(self.input_file)
+            col = find_video_url_column(df)
+            if col and '视频文案' not in df.columns:
+                df['视频文案'] = ''
+            if col:
+                for i, url in enumerate(df[col]):
+                    if pd.notna(url):
+                        cleaned = clean_url(url)
+                        if cleaned in results and results[cleaned]:
+                            df.at[i, '视频文案'] = results[cleaned]
+            if self.save_file.endswith('.csv'):
+                df.to_csv(self.save_file, index=False, encoding='utf-8-sig')
+            else:
+                df.to_excel(self.save_file, index=False)
+        except:
+            pass
 
+    def _start_worker(self, worker_id):
+        """启动一个 whisper 子进程"""
         env = os.environ.copy()
         env['PYTHONIOENCODING'] = 'utf-8'
-
-        self.progress_signal.emit(0, f"[Whisper] 启动常驻子进程, 加载 {WHISPER_MODEL_SIZE} 模型...")
-
-        proc = subprocess.Popen(
+        return subprocess.Popen(
             [sys.executable, '-c', self._whisper_worker_script(), WHISPER_MODEL_SIZE],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding='utf-8', errors='replace',
             env=env, bufsize=1
         )
 
-        try:
-            # 等待模型就绪信号
-            import select
-            ready = False
-            deadline = time.time() + 600  # 10 分钟超时
+    def _transcribe_batch_parallel(self, valid_audio):
+        """并行子进程批量处理"""
+        total = len(valid_audio)
+        results = {}
+        n_workers = min(self.workers, total)
+
+        self.progress_signal.emit(0, f"[Whisper] 启动 {n_workers} 个并行子进程, 加载 {WHISPER_MODEL_SIZE}...")
+
+        workers = []
+        for w in range(n_workers):
+            proc = self._start_worker(w)
+            workers.append(proc)
+
+        # 等待所有 worker 就绪
+        deadline = time.time() + 600
+        for w, proc in enumerate(workers):
             while time.time() < deadline:
                 if self.abort:
-                    proc.kill()
-                    return {}
+                    for p in workers:
+                        p.kill()
+                    return results
                 line = proc.stderr.readline()
                 if 'MODEL_READY' in line:
-                    ready = True
                     break
-            if not ready:
-                self.progress_signal.emit(0, "[Whisper] 模型加载超时")
-                proc.kill()
-                return {}
 
-            self.progress_signal.emit(0, "[Whisper] 模型就绪, 开始批量识别...")
+        self.progress_signal.emit(0, f"[Whisper] {n_workers} 个 worker 就绪, 开始并行识别...")
 
-            # 逐个发送音频路径，读取结果
-            for i, (url, audio_path) in enumerate(valid_audio):
-                if self.abort:
+        # 分发任务到各 worker 的 stdin（worker 会顺序处理）
+        # stdin 格式: url|audio_path，worker 输出时带回 url 避免竞态
+        completed = 0
+        task_num = 0
+        lock = threading.Lock()
+
+        def read_stdout(proc, idx):
+            nonlocal completed
+            while True:
+                line = proc.stdout.readline()
+                if not line:
                     break
                 try:
-                    fsize = os.path.getsize(audio_path)
-                    abspath = os.path.abspath(audio_path)
-                    self.progress_signal.emit(int((i + 1) / total * 100),
-                                              f"正在识别第 {i+1}/{total} 个 ({fsize//1024}KB)...")
+                    data = json.loads(line.strip())
+                    url = data.get('url', '')
+                    if url and data.get('ok'):
+                        results[url] = data['text']
+                    with lock:
+                        completed += 1
+                        self.progress_signal.emit(int(completed / total * 100),
+                            f"已完成 {completed}/{total} 个")
+                        if completed % 5 == 0:
+                            self._save_progress(results)
+                except:
+                    pass
 
-                    proc.stdin.write(abspath + '\n')
-                    proc.stdin.flush()
+        readers = []
+        for w in range(n_workers):
+            t = threading.Thread(target=read_stdout, args=(workers[w], w), daemon=True)
+            t.start()
+            readers.append(t)
 
-                    result_line = proc.stdout.readline()
-                    if result_line:
-                        data = json.loads(result_line.strip())
-                        if data.get('ok'):
-                            text = data['text']
-                            results[url] = text
-                            self.progress_signal.emit(int((i + 1) / total * 100),
-                                                      f"第 {i+1} 个完成 ({len(text)} 字): {text[:30]}...")
-                        else:
-                            results[url] = ""
-                            self.progress_signal.emit(int((i + 1) / total * 100),
-                                                      f"第 {i+1} 个失败: {data.get('error', '?')[:40]}")
-                    else:
-                        results[url] = ""
-                        self.progress_signal.emit(int((i + 1) / total * 100), f"第 {i+1} 个无输出")
-                except Exception as e:
-                    results[url] = ""
-                    self.progress_signal.emit(int((i + 1) / total * 100), f"识别异常: {str(e)[:60]}")
+        for url, audio_path in valid_audio:
+            if self.abort:
+                break
+            w = task_num % n_workers
+            abspath = os.path.abspath(audio_path)
+            workers[w].stdin.write(f"{url}|{abspath}\n")
+            workers[w].stdin.flush()
+            task_num += 1
 
-            # 通知子进程结束
-            proc.stdin.write('DONE\n')
-            proc.stdin.flush()
+        # 发送 DONE 关闭子进程（先于 reader.join！）
+        for proc in workers:
+            try:
+                proc.stdin.write('DONE\n')
+                proc.stdin.flush()
+            except:
+                pass
 
-        finally:
+        # 等待 reader 线程收集完所有结果
+        for reader in readers:
+            reader.join(timeout=600)
+
+        # 清理子进程
+        for proc in workers:
             try:
                 proc.stdin.close()
                 proc.wait(timeout=10)
@@ -471,22 +535,17 @@ class TranscribeThread(QThread):
         total = len(self.audio_files)
 
         if USE_WHISPER:
-            # 收集有效音频
             valid = []
-            idx_map = {}
-            for i, (url, audio_path) in enumerate(self.audio_files):
+            for url, audio_path in self.audio_files:
                 if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) >= 1000:
                     valid.append((url, audio_path))
-                    idx_map[url] = i
 
             if valid:
-                results = self._transcribe_batch(valid)
-                # 按原始顺序组装结果
+                results = self._transcribe_batch_parallel(valid)
                 for url, audio_path in self.audio_files:
-                    if url in results:
-                        transcriptions.append((url, results[url]))
-                    else:
-                        transcriptions.append((url, ""))
+                    transcriptions.append((url, results.get(url, "")))
+                # 最终保存
+                self._save_progress({clean_url(url): text for url, text in transcriptions})
             else:
                 for url, _ in self.audio_files:
                     transcriptions.append((url, ""))
@@ -582,20 +641,17 @@ AI_PROVIDERS = {
 
 
 class CorrectionThread(QThread):
-    """AI 文案修正 — 支持系统提示词 + 多条处理规则"""
+    """AI 文案修正 — 支持系统提示词 + 多条规则（每条独立源列）"""
     progress_signal = pyqtSignal(int, str)
-    finished_signal = pyqtSignal(object, dict)  # DataFrame, stats
+    finished_signal = pyqtSignal(object, dict)
 
-    def __init__(self, df, source_column, rules, api_url, model_name, api_key="", system_prompt=""):
+    def __init__(self, df, rules, api_url, model_name, api_key="", system_prompt=""):
         """
         df: 源 DataFrame
-        source_column: 要处理的源列名
-        rules: [(规则名称, 输出列名, 处理指令), ...]
-        system_prompt: 系统级提示词
+        rules: [(名称, 源列, 输出列, 处理指令), ...]
         """
         super().__init__()
         self.df = df.copy()
-        self.source_column = source_column
         self.rules = rules
         self.api_url = api_url
         self.model_name = model_name
@@ -608,7 +664,7 @@ class CorrectionThread(QThread):
         total_completion = 0
 
         # 确保所有输出列存在
-        for _, out_col, _ in self.rules:
+        for _, _, out_col, _ in self.rules:
             if out_col and out_col not in self.df.columns:
                 self.df[out_col] = ''
 
@@ -620,46 +676,70 @@ class CorrectionThread(QThread):
         for i in range(total):
             if self.abort:
                 break
-            text = str(self.df.iloc[i][self.source_column])
-            if len(text) < 10:
-                self.progress_signal.emit(int((i + 1) / total * 100), f"跳过第 {i+1} 行 (内容太短)")
-                continue
 
-            for rule_name, out_col, instruction in self.rules:
+            for rule_name, src_col, out_col, instruction in self.rules:
                 if self.abort:
                     break
-                if not out_col or not instruction:
+                if not src_col or not out_col or not instruction:
                     continue
-                try:
-                    messages = []
-                    if self.system_prompt:
-                        messages.append({"role": "system", "content": self.system_prompt})
-                    messages.append({"role": "user", "content": f"{instruction}\n\n---\n原文案:\n{text}"})
+                text = str(self.df.iloc[i][src_col])
+                if len(text) < 10:
+                    self.progress_signal.emit(int((i + 1) / total * 100), f"跳过第 {i+1} 行 [{rule_name}] (内容太短)")
+                    continue
 
-                    payload = {
-                        "model": self.model_name,
-                        "messages": messages,
-                        "temperature": 0.3,
-                        "max_tokens": 100000,
-                        "stream": False
-                    }
-                    resp = requests.post(self.api_url, json=payload, timeout=60000, headers=headers)
-                    resp.raise_for_status()
-                    result = resp.json()
-                    output = result['choices'][0]['message']['content'].strip()
-                    usage = result.get('usage', {})
-                    pt = usage.get('prompt_tokens', 0)
-                    ct = usage.get('completion_tokens', 0)
+                success = False
+                for attempt in range(1, 4):
+                    if self.abort:
+                        break
+                    try:
+                        messages = []
+                        if self.system_prompt:
+                            messages.append({"role": "system", "content": self.system_prompt})
+                        messages.append({"role": "user", "content": f"{instruction}\n\n---\n原文案:\n{text}"})
 
-                    self.df.at[i, out_col] = output
-                    total_prompt += pt
-                    total_completion += ct
+                        payload = {
+                            "model": self.model_name,
+                            "messages": messages,
+                            "temperature": 0.3,
+                            "max_tokens": 100000,
+                            "stream": False
+                        }
+                        resp = requests.post(self.api_url, json=payload, timeout=120, headers=headers)
+                        if resp.status_code == 200:
+                            result = resp.json()
+                            output = result['choices'][0]['message']['content'].strip()
+                            usage = result.get('usage', {})
+                            pt = usage.get('prompt_tokens', 0)
+                            ct = usage.get('completion_tokens', 0)
 
+                            self.df.at[i, out_col] = output
+                            total_prompt += pt
+                            total_completion += ct
+                            success = True
+                            self.progress_signal.emit(int((i + 1) / total * 100),
+                                                      f"第 {i+1} 行 [{rule_name}] 完成")
+                            break
+                        elif resp.status_code >= 500 and attempt < 3:
+                            time.sleep(3 * attempt)
+                        else:
+                            self.progress_signal.emit(int((i + 1) / total * 100),
+                                                      f"第 {i+1} 行 [{rule_name}] HTTP {resp.status_code}")
+                            break
+                    except requests.exceptions.Timeout:
+                        if attempt < 3:
+                            self.progress_signal.emit(int((i + 1) / total * 100),
+                                f"第 {i+1} 行 [{rule_name}] 超时, 重试 {attempt}/3...")
+                            time.sleep(2 * attempt)
+                    except requests.exceptions.ConnectionError:
+                        if attempt < 3:
+                            time.sleep(3 * attempt)
+                    except Exception as e:
+                        self.progress_signal.emit(int((i + 1) / total * 100),
+                                                  f"第 {i+1} 行 [{rule_name}] 异常: {str(e)[:40]}")
+                        break
+                if not success:
                     self.progress_signal.emit(int((i + 1) / total * 100),
-                                              f"第 {i+1} 行 [{rule_name}] 完成")
-                except Exception as e:
-                    self.progress_signal.emit(int((i + 1) / total * 100),
-                                              f"第 {i+1} 行 [{rule_name}] 失败: {str(e)[:50]}")
+                                              f"第 {i+1} 行 [{rule_name}] 失败(已重试)")
 
             time.sleep(1)
 
@@ -771,9 +851,25 @@ class CollectThread(QThread):
                     img_el = elem.query_selector("img")
                     cover = img_el.get_attribute("src") if img_el else "未知"
 
-                    # 标题
+                    # 短标题
                     title_el = elem.query_selector("p.EB3BkdQ8")
                     title = title_el.text_content().strip() if title_el else "未知"
+
+                    # 完整标题 (frUrWD64 或 img alt 去博主前缀)
+                    full_title = title
+                    full_el = elem.query_selector("p.frUrWD64")
+                    if full_el:
+                        full_title = full_el.text_content().strip()
+                    elif img_el:
+                        alt = img_el.get_attribute("alt") or ""
+                        if "：" in alt:
+                            full_title = alt.split("：", 1)[1].strip() or title
+                        elif ":" in alt:
+                            full_title = alt.split(":", 1)[1].strip() or title
+
+                    # 话题标签
+                    tags = re.findall(r'#[\w\u4e00-\u9fff-]+', full_title)
+                    tags_str = " ".join(tags) if tags else ""
 
                     # 点赞
                     like_el = elem.query_selector("span.HycZGr_s span.BP1CQkLg")
@@ -782,6 +878,8 @@ class CollectThread(QThread):
                     collected.append({
                         "序号": len(collected) + 1,
                         "视频标题": title[:100],
+                        "完整标题": full_title[:200],
+                        "话题标签": tags_str,
                         "视频链接": link,
                         "视频封面链接": cover,
                         "点赞数": likes,
@@ -959,7 +1057,8 @@ class CollectorTab(QWidget):
         self.data_count_label.setText(f"已采集: {len(self.collected_data)} 条")
         preview_lines = []
         for item in self.collected_data[:10]:
-            preview_lines.append(f"[{item['序号']}] {item['视频标题'][:40]} | 点赞: {item['点赞数']}")
+            tags = item.get('话题标签', '')
+            preview_lines.append(f"[{item['序号']}] {item['视频标题'][:30]} | 赞:{item['点赞数']} | {tags}")
         if len(self.collected_data) > 10:
             preview_lines.append(f"... 共 {len(self.collected_data)} 条")
         self.data_preview.setText("\n".join(preview_lines))
@@ -1180,6 +1279,22 @@ class ExtractorTab(QWidget):
             QMessageBox.critical(self, "错误", "没有有效的视频页面链接（已排除封面图片链接）")
             return
 
+        # 断点续传：跳过已有文案的视频
+        skipped = 0
+        if '视频文案' in df.columns:
+            col_idx = list(df.columns).index(col)
+            done_urls = set()
+            for i, url in enumerate(df[col]):
+                if pd.notna(url):
+                    cleaned = clean_url(url)
+                    existing = str(df.at[i, '视频文案'])
+                    if existing and existing != 'nan' and len(existing) > 5:
+                        done_urls.add(cleaned)
+            video_urls = [u for u in video_urls if u not in done_urls]
+            skipped = len(done_urls)
+            if skipped > 0:
+                self.log_signal.emit(f"断点续传: 跳过已完成的 {skipped} 个视频")
+
         self.log_signal.emit(f"找到 {len(video_urls)} 个有效视频链接:")
         for i, u in enumerate(video_urls[:5]):
             self.log_signal.emit(f"  [{i+1}] {u[:80]}")
@@ -1254,7 +1369,9 @@ class ExtractorTab(QWidget):
 
         self.log_signal.emit("开始语音识别...")
         print("[ExtractorTab] 启动 TranscribeThread...")
-        self.transcribe_thread = TranscribeThread(audio_files)
+        inp = self.file_path.text()
+        outp = self.save_path.text()
+        self.transcribe_thread = TranscribeThread(audio_files, input_file=inp, save_file=outp)
         self.transcribe_thread.progress_signal.connect(self.progress_signal)
         self.transcribe_thread.finished_signal.connect(self._on_transcribe_done)
         self.transcribe_thread.start()
@@ -1393,26 +1510,18 @@ class CorrectorTab(QWidget):
         layout.addWidget(gb_sys)
 
         # ── 处理规则 ──
-        gb_rules = QGroupBox("处理规则（支持多条规则同时处理）")
+        gb_rules = QGroupBox("处理规则（每条规则独立指定源列和输出列）")
         rules_layout = QVBoxLayout(gb_rules)
 
-        # 源列选择
-        hl_src = QHBoxLayout()
-        hl_src.addWidget(QLabel("源数据列:"))
-        self.source_col_combo = QComboBox()
-        self.source_col_combo.setMinimumWidth(150)
-        hl_src.addWidget(self.source_col_combo)
-        hl_src.addStretch()
-        rules_layout.addLayout(hl_src)
-
-        # 规则表格
-        self.rules_table = QTableWidget(0, 3)
-        self.rules_table.setHorizontalHeaderLabels(["规则名称", "输出列名", "处理指令"])
+        # 规则表格: 规则名称 | 源列 | 输出列名 | 处理指令
+        self.rules_table = QTableWidget(0, 4)
+        self.rules_table.setHorizontalHeaderLabels(["规则名称", "源列", "输出列名", "处理指令"])
         self.rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.rules_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.rules_table.setMinimumHeight(200)
-        self.rules_table.setMaximumHeight(16777215)  # Qt max
+        self.rules_table.setMaximumHeight(16777215)
         rules_layout.addWidget(self.rules_table)
 
         # 规则操作按钮
@@ -1462,18 +1571,20 @@ class CorrectorTab(QWidget):
         layout.addStretch()
 
         # 默认添加一条规则
-        self._add_rule("错别字修正", "修正后文案", "请修正以下文案中的错别字和语法错误，只返回修正后的文案，不要解释。")
+        self._add_rule("错别字修正", "视频文案", "修正后文案",
+                       "请修正以下文案中的错别字和语法错误，只返回修正后的文案，不要解释。")
 
     # ═══════════════════════════════════════════════════════════
     # 规则管理
     # ═══════════════════════════════════════════════════════════
 
-    def _add_rule(self, name="", out_col="", instruction=""):
+    def _add_rule(self, name="", src_col="", out_col="", instruction=""):
         row = self.rules_table.rowCount()
         self.rules_table.insertRow(row)
         self.rules_table.setItem(row, 0, QTableWidgetItem(name))
-        self.rules_table.setItem(row, 1, QTableWidgetItem(out_col))
-        self.rules_table.setItem(row, 2, QTableWidgetItem(instruction))
+        self.rules_table.setItem(row, 1, QTableWidgetItem(src_col))
+        self.rules_table.setItem(row, 2, QTableWidgetItem(out_col))
+        self.rules_table.setItem(row, 3, QTableWidgetItem(instruction))
 
     def _del_rule(self):
         rows = set()
@@ -1483,17 +1594,15 @@ class CorrectorTab(QWidget):
             self.rules_table.removeRow(row)
 
     def _get_rules(self):
-        """从表格读取当前所有规则"""
+        """从表格读取所有规则: (名称, 源列, 输出列, 处理指令)"""
         rules = []
         for row in range(self.rules_table.rowCount()):
-            name = (self.rules_table.item(row, 0).text().strip()
-                    if self.rules_table.item(row, 0) else "")
-            out_col = (self.rules_table.item(row, 1).text().strip()
-                       if self.rules_table.item(row, 1) else "")
-            inst = (self.rules_table.item(row, 2).text().strip()
-                    if self.rules_table.item(row, 2) else "")
-            if out_col and inst:
-                rules.append((name or out_col, out_col, inst))
+            name = self.rules_table.item(row, 0).text().strip() if self.rules_table.item(row, 0) else ""
+            src_col = self.rules_table.item(row, 1).text().strip() if self.rules_table.item(row, 1) else ""
+            out_col = self.rules_table.item(row, 2).text().strip() if self.rules_table.item(row, 2) else ""
+            inst = self.rules_table.item(row, 3).text().strip() if self.rules_table.item(row, 3) else ""
+            if src_col and out_col and inst:
+                rules.append((name or out_col, src_col, out_col, inst))
         return rules
 
     def _save_config(self):
@@ -1508,9 +1617,10 @@ class CorrectorTab(QWidget):
         }
         for row in range(self.rules_table.rowCount()):
             name = self.rules_table.item(row, 0).text().strip() if self.rules_table.item(row, 0) else ""
-            out_col = self.rules_table.item(row, 1).text().strip() if self.rules_table.item(row, 1) else ""
-            inst = self.rules_table.item(row, 2).text().strip() if self.rules_table.item(row, 2) else ""
-            data["rules"].append({"name": name, "output_col": out_col, "instruction": inst})
+            src_col = self.rules_table.item(row, 1).text().strip() if self.rules_table.item(row, 1) else ""
+            out_col = self.rules_table.item(row, 2).text().strip() if self.rules_table.item(row, 2) else ""
+            inst = self.rules_table.item(row, 3).text().strip() if self.rules_table.item(row, 3) else ""
+            data["rules"].append({"name": name, "source_col": src_col, "output_col": out_col, "instruction": inst})
 
         path, _ = QFileDialog.getSaveFileName(self, "保存配置", "ai_config.json", "JSON (*.json)")
         if path:
@@ -1545,6 +1655,7 @@ class CorrectorTab(QWidget):
             for rule in data.get("rules", []):
                 self._add_rule(
                     rule.get("name", ""),
+                    rule.get("source_col", ""),
                     rule.get("output_col", ""),
                     rule.get("instruction", "")
                 )
@@ -1637,13 +1748,7 @@ class CorrectorTab(QWidget):
         try:
             self.df = pd.read_csv(p, encoding='utf-8') if p.endswith('.csv') else pd.read_excel(p)
             self.file_label.setText(f"已加载: {os.path.basename(p)} ({len(self.df)} 行)")
-            # 更新源列下拉
-            self.source_col_combo.clear()
-            text_cols = [c for c in self.df.columns if self.df[c].dtype == object]
-            self.source_col_combo.addItems(text_cols)
-            if '视频文案' in text_cols:
-                self.source_col_combo.setCurrentText('视频文案')
-            self.log_signal.emit(f"✓ 加载 {len(self.df)} 行, 可选列: {', '.join(text_cols)}")
+            self.log_signal.emit(f"✓ 加载 {len(self.df)} 行, 列: {', '.join(self.df.columns)}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"加载失败: {e}")
 
@@ -1673,21 +1778,22 @@ class CorrectorTab(QWidget):
         if not rules:
             QMessageBox.warning(self, "提示", "请至少添加一条处理规则")
             return
-        src_col = self.source_col_combo.currentText()
-        if not src_col or src_col not in self.df.columns:
-            QMessageBox.warning(self, "提示", "请选择有效的源数据列")
-            return
+        # 验证所有源列存在
+        for name, src_col, out_col, inst in rules:
+            if src_col not in self.df.columns:
+                QMessageBox.warning(self, "提示", f"规则 [{name}] 的源列 '{src_col}' 不在表格中\n可用列: {list(self.df.columns)}")
+                return
 
-        rule_names = ", ".join([f"{n}→{c}" for n, c, _ in rules])
+        rule_desc = ", ".join([f"{n}: {s}→{o}" for n, s, o, _ in rules])
         if not QMessageBox.question(self, "确认",
-                                    f"将对 {len(self.df)} 行文案, 执行 {len(rules)} 条规则:\n{rule_names}\n\n是否继续?"):
+                                    f"将对 {len(self.df)} 行执行 {len(rules)} 条规则:\n{rule_desc}\n\n是否继续?"):
             return
 
         self.btn_batch.setEnabled(False)
         sys_prompt = self.system_prompt.toPlainText().strip()
 
         self.correct_thread = CorrectionThread(
-            self.df, src_col, rules,
+            self.df, rules,
             self.api_url.text(), self.model_name.currentText(),
             self.api_key.text().strip(), sys_prompt
         )
@@ -1712,11 +1818,6 @@ class CorrectorTab(QWidget):
         try:
             self.df = pd.read_csv(path, encoding='utf-8') if path.endswith('.csv') else pd.read_excel(path)
             self.file_label.setText(f"已加载: {os.path.basename(path)} ({len(self.df)} 行)")
-            self.source_col_combo.clear()
-            text_cols = [c for c in self.df.columns if self.df[c].dtype == object]
-            self.source_col_combo.addItems(text_cols)
-            if '视频文案' in text_cols:
-                self.source_col_combo.setCurrentText('视频文案')
             self.log_signal.emit(f"✓ 自动加载 {len(self.df)} 行")
         except Exception as e:
             self.log_signal.emit(f"自动加载失败: {e}")
