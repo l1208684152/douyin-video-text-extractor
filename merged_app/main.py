@@ -385,11 +385,21 @@ class TranscribeThread(QThread):
     @staticmethod
     def _whisper_worker_script():
         return (
-            "import sys, json, os, warnings\n"
+            "import sys, json, os, warnings, signal\n"
             "warnings.filterwarnings('ignore')\n"
             "sys.stdout.reconfigure(encoding='utf-8')\n"
-            "import whisper\n"
-            "model = whisper.load_model(sys.argv[1])\n"
+            # 崩溃前输出诊断
+            "def _on_crash(sig, frame):\n"
+            "    sys.stderr.write(f'WORKER_CRASH signal={sig}\\n')\n"
+            "    sys.stderr.flush()\n"
+            "    sys.exit(1)\n"
+            "signal.signal(signal.SIGABRT, _on_crash)\n"
+            "try:\n"
+            "    import whisper\n"
+            "    model = whisper.load_model(sys.argv[1])\n"
+            "except Exception as e:\n"
+            "    print(json.dumps({'url':'', 'ok':False, 'error':f'MODEL_LOAD_FAILED: {str(e)[:200]}', 'fsize':0}, ensure_ascii=False), flush=True)\n"
+            "    sys.exit(1)\n"
             "sys.stderr.write('MODEL_READY\\n')\n"
             "sys.stderr.flush()\n"
             "for line in sys.stdin:\n"
@@ -512,15 +522,43 @@ class TranscribeThread(QThread):
                 break
             w = task_num % n_workers
             abspath = os.path.abspath(audio_path)
-            workers[w].stdin.write(f"{url}|{abspath}\n")
-            workers[w].stdin.flush()
+
+            # 检测子进程是否存活，崩溃则重启
+            if workers[w].poll() is not None:
+                self.progress_signal.emit(0, f"[Whisper] Worker{w} 崩溃 (code={workers[w].returncode}), 正在重启...")
+                # 清理旧进程
+                try:
+                    workers[w].stdin.close()
+                    workers[w].wait(timeout=5)
+                except:
+                    workers[w].kill()
+                # 重启
+                workers[w] = self._start_worker(w)
+                # 等待 MODEL_READY
+                deadline2 = time.time() + 300
+                while time.time() < deadline2:
+                    line = workers[w].stderr.readline()
+                    if 'MODEL_READY' in line:
+                        break
+                # 重启 reader 线程（daemon，旧线程会自动退出）
+                t = threading.Thread(target=read_stdout, args=(workers[w], w), daemon=True)
+                t.start()
+                readers.append(t)
+
+            try:
+                workers[w].stdin.write(f"{url}|{abspath}\n")
+                workers[w].stdin.flush()
+            except (BrokenPipeError, OSError) as e:
+                # 写入时才发现进程已死，标记为失败，下次循环会重启
+                self.progress_signal.emit(0, f"[Whisper] Worker{w} 写入失败: {str(e)[:80]}, 下次重试")
             task_num += 1
 
         # 发送 DONE 关闭子进程（先于 reader.join！）
         for proc in workers:
             try:
-                proc.stdin.write('DONE\n')
-                proc.stdin.flush()
+                if proc.poll() is None:
+                    proc.stdin.write('DONE\n')
+                    proc.stdin.flush()
             except:
                 pass
 
