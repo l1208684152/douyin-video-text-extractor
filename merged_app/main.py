@@ -385,7 +385,7 @@ class TranscribeThread(QThread):
     @staticmethod
     def _whisper_worker_script():
         return (
-            "import sys, json, warnings\n"
+            "import sys, json, os, warnings\n"
             "warnings.filterwarnings('ignore')\n"
             "sys.stdout.reconfigure(encoding='utf-8')\n"
             "import whisper\n"
@@ -399,12 +399,14 @@ class TranscribeThread(QThread):
             "    parts = line.split('|', 1)\n"
             "    task_url = parts[0] if len(parts) > 1 else ''\n"
             "    path = parts[1] if len(parts) > 1 else line\n"
+            "    fsize = os.path.getsize(path) if os.path.exists(path) else 0\n"
             "    try:\n"
             "        r = model.transcribe(path, language='zh', fp16=False,"
             "            initial_prompt='请将以下中文语音转换为简体中文文字。')\n"
-            "        print(json.dumps({'url': task_url, 'ok': True, 'text': r['text'].strip()}, ensure_ascii=False), flush=True)\n"
+            "        print(json.dumps({'url': task_url, 'ok': True, 'text': r['text'].strip(), 'fsize': fsize, 'dur': round(r.get('segments', [{'end':0}])[-1].get('end',0), 1)}, ensure_ascii=False), flush=True)\n"
             "    except Exception as e:\n"
-            "        print(json.dumps({'url': task_url, 'ok': False, 'error': str(e)}, ensure_ascii=False), flush=True)\n"
+            "        import traceback\n"
+            "        print(json.dumps({'url': task_url, 'ok': False, 'error': str(e)[:200], 'fsize': fsize, 'traceback': traceback.format_exc()[:500]}, ensure_ascii=False), flush=True)\n"
         )
 
     def _save_progress(self, results):
@@ -483,15 +485,21 @@ class TranscribeThread(QThread):
                     data = json.loads(line.strip())
                     url = data.get('url', '')
                     if url and data.get('ok'):
-                        results[url] = data['text']
+                        text = data.get('text', '')
+                        if text:
+                            results[url] = text
+                        else:
+                            self.progress_signal.emit(0, f"[Whisper Worker{idx}] 空结果: {url[:50]}... (文件{data.get('fsize',0)}B, 时长{data.get('dur',0)}s)")
+                    elif url:
+                        self.progress_signal.emit(0, f"[Whisper Worker{idx}] 失败: {url[:50]}... | 错误: {data.get('error','?')[:100]} | 文件: {data.get('fsize',0)}B")
                     with lock:
                         completed += 1
                         self.progress_signal.emit(int(completed / total * 100),
                             f"已完成 {completed}/{total} 个")
                         if completed % 5 == 0:
                             self._save_progress(results)
-                except:
-                    pass
+                except Exception as ex:
+                    self.progress_signal.emit(0, f"[Whisper Worker{idx}] 解析响应异常: {str(ex)[:100]}")
 
         readers = []
         for w in range(n_workers):
@@ -528,6 +536,13 @@ class TranscribeThread(QThread):
             except:
                 proc.kill()
 
+        # 诊断：哪些任务没结果
+        no_result = [url for url, _ in valid_audio if url not in results]
+        if no_result:
+            self.progress_signal.emit(0, f"[Whisper] {len(no_result)}/{total} 个任务无响应 (子进程可能崩溃)")
+            for u in no_result[:5]:
+                self.progress_signal.emit(0, f"  无响应: {u[:80]}...")
+
         return results
 
     def run(self):
@@ -536,9 +551,21 @@ class TranscribeThread(QThread):
 
         if USE_WHISPER:
             valid = []
+            skipped = []
             for url, audio_path in self.audio_files:
                 if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) >= 1000:
                     valid.append((url, audio_path))
+                else:
+                    fsize = os.path.getsize(audio_path) if audio_path and os.path.exists(audio_path) else 0
+                    exists = os.path.exists(audio_path) if audio_path else False
+                    skipped.append((url, audio_path, fsize, exists))
+
+            # 诊断跳过的文件
+            if skipped:
+                self.progress_signal.emit(0, f"[Whisper] 跳过 {len(skipped)}/{total} 个无效音频:")
+                for url, ap, fsize, exists in skipped[:10]:
+                    reason = "文件不存在" if not exists else f"文件太小({fsize}B)"
+                    self.progress_signal.emit(0, f"  跳过: {url[:60]}... | {reason}")
 
             if valid:
                 results = self._transcribe_batch_parallel(valid)
