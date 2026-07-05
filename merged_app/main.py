@@ -464,18 +464,30 @@ class TranscribeThread(QThread):
         for w in range(n_workers):
             proc = self._start_worker(w)
             workers.append(proc)
+            self.progress_signal.emit(0, f"[Whisper] Worker{w} PID={proc.pid} 已启动")
 
-        # 等待所有 worker 就绪
-        deadline = time.time() + 600
+        # 等待所有 worker 就绪，同时收集 stderr 诊断
         for w, proc in enumerate(workers):
+            self.progress_signal.emit(0, f"[Whisper] 等待 Worker{w} MODEL_READY...")
+            deadline = time.time() + 600
             while time.time() < deadline:
                 if self.abort:
                     for p in workers:
                         p.kill()
                     return results
                 line = proc.stderr.readline()
-                if 'MODEL_READY' in line:
+                if line:
+                    stripped = line.strip()
+                    if stripped:
+                        self.progress_signal.emit(0, f"[Whisper Worker{w} stderr] {stripped[:200]}")
+                    if 'MODEL_READY' in stripped:
+                        self.progress_signal.emit(0, f"[Whisper] Worker{w} 就绪")
+                        break
+                else:
+                    self.progress_signal.emit(0, f"[Whisper] Worker{w} stderr EOF (进程异常退出)")
                     break
+            else:
+                self.progress_signal.emit(0, f"[Whisper] Worker{w} 等待超时!")
 
         self.progress_signal.emit(0, f"[Whisper] {n_workers} 个 worker 就绪, 开始并行识别...")
 
@@ -487,10 +499,14 @@ class TranscribeThread(QThread):
 
         def read_stdout(proc, idx):
             nonlocal completed
+            self.progress_signal.emit(0, f"[Whisper Worker{idx}] stdout reader 启动")
+            line_count = 0
             while True:
                 line = proc.stdout.readline()
                 if not line:
+                    self.progress_signal.emit(0, f"[Whisper Worker{idx}] stdout EOF (已读取 {line_count} 条)")
                     break
+                line_count += 1
                 try:
                     data = json.loads(line.strip())
                     url = data.get('url', '')
@@ -509,19 +525,42 @@ class TranscribeThread(QThread):
                         if completed % 5 == 0:
                             self._save_progress(results)
                 except Exception as ex:
-                    self.progress_signal.emit(0, f"[Whisper Worker{idx}] 解析响应异常: {str(ex)[:100]}")
+                    self.progress_signal.emit(0, f"[Whisper Worker{idx}] 解析响应异常: {str(ex)[:100]} | raw前100: {line.strip()[:100]}")
+
+        # stderr 监控线程
+        def read_stderr(proc, idx):
+            self.progress_signal.emit(0, f"[Whisper Worker{idx}] stderr monitor 启动")
+            while True:
+                line = proc.stderr.readline()
+                if not line:
+                    self.progress_signal.emit(0, f"[Whisper Worker{idx}] stderr monitor EOF")
+                    break
+                stripped = line.strip()
+                if stripped:
+                    self.progress_signal.emit(0, f"[Whisper Worker{idx} stderr] {stripped[:200]}")
 
         readers = []
+        stderr_monitors = []
         for w in range(n_workers):
             t = threading.Thread(target=read_stdout, args=(workers[w], w), daemon=True)
             t.start()
             readers.append(t)
+            ts = threading.Thread(target=read_stderr, args=(workers[w], w), daemon=True)
+            ts.start()
+            stderr_monitors.append(ts)
 
+        # 逐任务分发，带详细日志
+        self.progress_signal.emit(0, f"[Whisper] 开始分发 {total} 个任务...")
         for url, audio_path in valid_audio:
             if self.abort:
                 break
             w = task_num % n_workers
             abspath = os.path.abspath(audio_path)
+            fsize = os.path.getsize(abspath) if os.path.exists(abspath) else 0
+
+            # 前10个和后10个任务详细日志
+            if task_num < 10 or task_num >= total - 10:
+                self.progress_signal.emit(0, f"[Whisper] 分发 #{task_num+1}/{total} → Worker{w} | {os.path.basename(abspath)} ({fsize}B)")
 
             # 检测子进程是否存活，崩溃则重启
             if workers[w].poll() is not None:
@@ -534,37 +573,58 @@ class TranscribeThread(QThread):
                     workers[w].kill()
                 # 重启
                 workers[w] = self._start_worker(w)
+                self.progress_signal.emit(0, f"[Whisper] Worker{w} 新PID={workers[w].pid}")
                 # 等待 MODEL_READY
                 deadline2 = time.time() + 300
                 while time.time() < deadline2:
                     line = workers[w].stderr.readline()
-                    if 'MODEL_READY' in line:
-                        break
-                # 重启 reader 线程（daemon，旧线程会自动退出）
+                    if line:
+                        stripped = line.strip()
+                        if stripped:
+                            self.progress_signal.emit(0, f"[Whisper Worker{w} stderr] {stripped[:200]}")
+                        if 'MODEL_READY' in stripped:
+                            break
+                # 重启 reader 和 stderr monitor 线程
                 t = threading.Thread(target=read_stdout, args=(workers[w], w), daemon=True)
                 t.start()
                 readers.append(t)
+                ts = threading.Thread(target=read_stderr, args=(workers[w], w), daemon=True)
+                ts.start()
+                stderr_monitors.append(ts)
 
             try:
                 workers[w].stdin.write(f"{url}|{abspath}\n")
                 workers[w].stdin.flush()
             except (BrokenPipeError, OSError) as e:
-                # 写入时才发现进程已死，标记为失败，下次循环会重启
                 self.progress_signal.emit(0, f"[Whisper] Worker{w} 写入失败: {str(e)[:80]}, 下次重试")
+
             task_num += 1
+            # 每10个任务检查一次子进程状态
+            if task_num % 10 == 0:
+                for wi, proc in enumerate(workers):
+                    status = "存活" if proc.poll() is None else f"已退出(code={proc.returncode})"
+                self.progress_signal.emit(0, f"[Whisper] 已分发 {task_num}/{total}, Worker状态: " +
+                    ", ".join(f"W{wi}={('存活' if workers[wi].poll() is None else f'死({workers[wi].returncode})')}" for wi in range(n_workers)))
+
+        self.progress_signal.emit(0, f"[Whisper] 全部 {task_num} 个任务已分发, 发送 DONE 信号...")
 
         # 发送 DONE 关闭子进程（先于 reader.join！）
-        for proc in workers:
+        for w, proc in enumerate(workers):
             try:
                 if proc.poll() is None:
                     proc.stdin.write('DONE\n')
                     proc.stdin.flush()
-            except:
-                pass
+                    self.progress_signal.emit(0, f"[Whisper] Worker{w} DONE 已发送")
+                else:
+                    self.progress_signal.emit(0, f"[Whisper] Worker{w} 已退出, 跳过 DONE")
+            except Exception as e:
+                self.progress_signal.emit(0, f"[Whisper] Worker{w} DONE 发送失败: {str(e)[:80]}")
 
         # 等待 reader 线程收集完所有结果
-        for reader in readers:
+        self.progress_signal.emit(0, f"[Whisper] 等待 stdout reader 完成 (共 {len(readers)} 个)...")
+        for r, reader in enumerate(readers):
             reader.join(timeout=600)
+            self.progress_signal.emit(0, f"[Whisper] reader{r} 已退出")
 
         # 清理子进程
         for proc in workers:
@@ -578,8 +638,10 @@ class TranscribeThread(QThread):
         no_result = [url for url, _ in valid_audio if url not in results]
         if no_result:
             self.progress_signal.emit(0, f"[Whisper] {len(no_result)}/{total} 个任务无响应 (子进程可能崩溃)")
-            for u in no_result[:5]:
+            for u in no_result[:10]:
                 self.progress_signal.emit(0, f"  无响应: {u[:80]}...")
+        else:
+            self.progress_signal.emit(0, f"[Whisper] 全部 {total} 个任务均有响应")
 
         return results
 
