@@ -565,12 +565,14 @@ class TranscribeThread(QThread):
                 # 等待响应
                 try:
                     resp_url, ok, text, data = response_queues[w].get(timeout=600)
+                    dur = data.get('dur', 0)
+                    fsize = data.get('fsize', 0)
                     if ok and text:
                         results[resp_url] = text
                     elif ok:
-                        self.progress_signal.emit(0, f"[Whisper Worker{w}] 空结果: {resp_url[:50]}... (文件{data.get('fsize',0)}B)")
+                        self.progress_signal.emit(0, f"[Whisper Worker{w}] 空结果: 文件{fsize}B, 时长{dur}s (可能是纯音乐/无声)")
                     else:
-                        self.progress_signal.emit(0, f"[Whisper Worker{w}] 失败: {resp_url[:50]}... | {data.get('error','?')[:100]}")
+                        self.progress_signal.emit(0, f"[Whisper Worker{w}] 失败: 文件{fsize}B | {data.get('error','?')[:100]}")
                 except queue.Empty:
                     self.progress_signal.emit(0, f"[Whisper] Worker{w} 响应超时 (任务 {task_idx+1})")
 
@@ -620,15 +622,31 @@ class TranscribeThread(QThread):
         if USE_WHISPER:
             valid = []
             skipped = []
+            silent = []
             for url, audio_path in self.audio_files:
                 if audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) >= 1000:
-                    valid.append((url, audio_path))
+                    # 静音检测
+                    try:
+                        import numpy as np
+                        import wave
+                        with wave.open(audio_path, 'rb') as wf:
+                            frames = wf.readframes(wf.getnframes())
+                        audio_data = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+                        rms = np.sqrt(np.mean(audio_data ** 2))
+                        if rms < 50:  # 几乎无声
+                            silent.append((url, audio_path, rms))
+                            self.progress_signal.emit(0, f"[Whisper] 静音: {url[:50]}... (RMS={rms:.1f})")
+                        else:
+                            valid.append((url, audio_path))
+                    except Exception:
+                        valid.append((url, audio_path))  # 读不了的直接给 Whisper 处理
                 else:
                     fsize = os.path.getsize(audio_path) if audio_path and os.path.exists(audio_path) else 0
                     exists = os.path.exists(audio_path) if audio_path else False
                     skipped.append((url, audio_path, fsize, exists))
 
-            # 诊断跳过的文件
+            if silent:
+                self.progress_signal.emit(0, f"[Whisper] {len(silent)}/{total} 个静音文件 (RMS<50), 将跳过识别")
             if skipped:
                 self.progress_signal.emit(0, f"[Whisper] 跳过 {len(skipped)}/{total} 个无效音频:")
                 for url, ap, fsize, exists in skipped[:10]:
