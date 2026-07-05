@@ -9,6 +9,7 @@ import os
 import json
 import subprocess
 import threading
+import queue
 import tempfile
 import shutil
 import time
@@ -472,7 +473,7 @@ class TranscribeThread(QThread):
         )
 
     def _transcribe_batch_parallel(self, valid_audio):
-        """并行子进程批量处理"""
+        """并行子进程批量处理 — 请求响应模式，逐任务发送避免管道竞态"""
         total = len(valid_audio)
         results = {}
         n_workers = min(self.workers, total)
@@ -485,7 +486,6 @@ class TranscribeThread(QThread):
             workers.append(proc)
             self.progress_signal.emit(0, f"[Whisper] Worker{w} PID={proc.pid} 已启动")
 
-        # 等待所有 worker 就绪，同时收集 stderr 诊断
         for w, proc in enumerate(workers):
             self.progress_signal.emit(0, f"[Whisper] 等待 Worker{w} MODEL_READY...")
             deadline = time.time() + 600
@@ -495,169 +495,118 @@ class TranscribeThread(QThread):
                         p.kill()
                     return results
                 line = proc.stderr.readline()
-                if line:
-                    stripped = line.strip()
-                    if stripped:
-                        self.progress_signal.emit(0, f"[Whisper Worker{w} stderr] {stripped[:200]}")
-                    if 'MODEL_READY' in stripped:
-                        self.progress_signal.emit(0, f"[Whisper] Worker{w} 就绪")
-                        break
-                else:
+                if not line:
                     self.progress_signal.emit(0, f"[Whisper] Worker{w} stderr EOF (进程异常退出)")
+                    break
+                stripped = line.strip()
+                if stripped:
+                    self.progress_signal.emit(0, f"[Whisper Worker{w} stderr] {stripped[:200]}")
+                if 'MODEL_READY' in stripped:
+                    self.progress_signal.emit(0, f"[Whisper] Worker{w} 就绪")
                     break
             else:
                 self.progress_signal.emit(0, f"[Whisper] Worker{w} 等待超时!")
 
-        self.progress_signal.emit(0, f"[Whisper] {n_workers} 个 worker 就绪, 开始并行识别...")
+        self.progress_signal.emit(0, f"[Whisper] {n_workers} 个 worker 就绪, 请求响应模式...")
 
-        # 分发任务到各 worker 的 stdin（worker 会顺序处理）
-        # stdin 格式: url|audio_path，worker 输出时带回 url 避免竞态
         completed = 0
-        task_num = 0
         lock = threading.Lock()
+        # 每个 worker 一个响应队列: [(url, ok, text)]
+        response_queues = {w: queue.Queue() for w in range(n_workers)}
 
         def read_stdout(proc, idx):
-            nonlocal completed
-            self.progress_signal.emit(0, f"[Whisper Worker{idx}] stdout reader 启动")
-            line_count = 0
             while True:
                 line = proc.stdout.readline()
                 if not line:
-                    self.progress_signal.emit(0, f"[Whisper Worker{idx}] stdout EOF (已读取 {line_count} 条)")
                     break
-                line_count += 1
                 try:
                     data = json.loads(line.strip())
                     url = data.get('url', '')
-                    if url and data.get('ok'):
-                        text = data.get('text', '')
-                        if text:
-                            results[url] = text
-                        else:
-                            self.progress_signal.emit(0, f"[Whisper Worker{idx}] 空结果: {url[:50]}... (文件{data.get('fsize',0)}B, 时长{data.get('dur',0)}s)")
-                    elif url:
-                        self.progress_signal.emit(0, f"[Whisper Worker{idx}] 失败: {url[:50]}... | 错误: {data.get('error','?')[:100]} | 文件: {data.get('fsize',0)}B")
-                    with lock:
-                        completed += 1
-                        self.progress_signal.emit(int(completed / total * 100),
-                            f"已完成 {completed}/{total} 个")
-                        if completed % 5 == 0:
-                            self._save_progress(results)
-                except Exception as ex:
-                    self.progress_signal.emit(0, f"[Whisper Worker{idx}] 解析响应异常: {str(ex)[:100]} | raw前100: {line.strip()[:100]}")
+                    ok = data.get('ok', False)
+                    text = data.get('text', '')
+                    response_queues[idx].put((url, ok, text, data))
+                except:
+                    pass
 
-        # stderr 监控线程
         def read_stderr(proc, idx):
-            self.progress_signal.emit(0, f"[Whisper Worker{idx}] stderr monitor 启动")
             while True:
                 line = proc.stderr.readline()
                 if not line:
-                    self.progress_signal.emit(0, f"[Whisper Worker{idx}] stderr monitor EOF")
                     break
                 stripped = line.strip()
                 if stripped:
                     self.progress_signal.emit(0, f"[Whisper Worker{idx} stderr] {stripped[:200]}")
 
-        readers = []
-        stderr_monitors = []
         for w in range(n_workers):
-            t = threading.Thread(target=read_stdout, args=(workers[w], w), daemon=True)
-            t.start()
-            readers.append(t)
-            ts = threading.Thread(target=read_stderr, args=(workers[w], w), daemon=True)
-            ts.start()
-            stderr_monitors.append(ts)
+            threading.Thread(target=read_stdout, args=(workers[w], w), daemon=True).start()
+            threading.Thread(target=read_stderr, args=(workers[w], w), daemon=True).start()
 
-        # 逐任务分发，带详细日志
-        self.progress_signal.emit(0, f"[Whisper] 开始分发 {total} 个任务...")
-        for url, audio_path in valid_audio:
-            if self.abort:
-                break
-            w = task_num % n_workers
-            abspath = os.path.abspath(audio_path)
-            fsize = os.path.getsize(abspath) if os.path.exists(abspath) else 0
+        # 任务按 worker 分区（轮询分配）
+        worker_tasks = {w: [] for w in range(n_workers)}
+        for i, (url, audio_path) in enumerate(valid_audio):
+            w = i % n_workers
+            worker_tasks[w].append((url, audio_path, i))
 
-            # 前10个和后10个任务详细日志
-            if task_num < 10 or task_num >= total - 10:
-                self.progress_signal.emit(0, f"[Whisper] 分发 #{task_num+1}/{total} → Worker{w} | {os.path.basename(abspath)} ({fsize}B)")
+        def dispatch_worker(w):
+            nonlocal completed
+            for url, audio_path, task_idx in worker_tasks[w]:
+                if self.abort:
+                    return
+                abspath = os.path.abspath(audio_path)
 
-            # 检测子进程是否存活，崩溃则重启
-            if workers[w].poll() is not None:
-                self.progress_signal.emit(0, f"[Whisper] Worker{w} 崩溃 (code={workers[w].returncode}), 正在重启...")
-                # 清理旧进程
+                # 发送一个任务
                 try:
-                    workers[w].stdin.close()
-                    workers[w].wait(timeout=5)
-                except:
-                    workers[w].kill()
-                # 重启
-                workers[w] = self._start_worker(w)
-                self.progress_signal.emit(0, f"[Whisper] Worker{w} 新PID={workers[w].pid}")
-                # 等待 MODEL_READY
-                deadline2 = time.time() + 300
-                while time.time() < deadline2:
-                    line = workers[w].stderr.readline()
-                    if line:
-                        stripped = line.strip()
-                        if stripped:
-                            self.progress_signal.emit(0, f"[Whisper Worker{w} stderr] {stripped[:200]}")
-                        if 'MODEL_READY' in stripped:
-                            break
-                # 重启 reader 和 stderr monitor 线程
-                t = threading.Thread(target=read_stdout, args=(workers[w], w), daemon=True)
-                t.start()
-                readers.append(t)
-                ts = threading.Thread(target=read_stderr, args=(workers[w], w), daemon=True)
-                ts.start()
-                stderr_monitors.append(ts)
+                    workers[w].stdin.write(f"{url}|{abspath}\n")
+                    workers[w].stdin.flush()
+                except (BrokenPipeError, OSError):
+                    self.progress_signal.emit(0, f"[Whisper] Worker{w} 管道断开, 跳过剩余 {len(worker_tasks[w]) - task_idx} 个任务")
+                    return
 
+                # 等待响应
+                try:
+                    resp_url, ok, text, data = response_queues[w].get(timeout=600)
+                    if ok and text:
+                        results[resp_url] = text
+                    elif ok:
+                        self.progress_signal.emit(0, f"[Whisper Worker{w}] 空结果: {resp_url[:50]}... (文件{data.get('fsize',0)}B)")
+                    else:
+                        self.progress_signal.emit(0, f"[Whisper Worker{w}] 失败: {resp_url[:50]}... | {data.get('error','?')[:100]}")
+                except queue.Empty:
+                    self.progress_signal.emit(0, f"[Whisper] Worker{w} 响应超时 (任务 {task_idx+1})")
+
+                with lock:
+                    completed += 1
+                    self.progress_signal.emit(int(completed / total * 100), f"已完成 {completed}/{total} 个")
+                    if completed % 5 == 0:
+                        self._save_progress(results)
+
+            # 该 worker 任务发完，关闭 stdin
             try:
-                workers[w].stdin.write(f"{url}|{abspath}\n")
-                workers[w].stdin.flush()
-            except (BrokenPipeError, OSError) as e:
-                self.progress_signal.emit(0, f"[Whisper] Worker{w} 写入失败: {str(e)[:80]}, 下次重试")
+                workers[w].stdin.close()
+            except:
+                pass
 
-            task_num += 1
-            # 每10个任务检查一次子进程状态
-            if task_num % 10 == 0:
-                for wi, proc in enumerate(workers):
-                    status = "存活" if proc.poll() is None else f"已退出(code={proc.returncode})"
-                self.progress_signal.emit(0, f"[Whisper] 已分发 {task_num}/{total}, Worker状态: " +
-                    ", ".join(f"W{wi}={('存活' if workers[wi].poll() is None else f'死({workers[wi].returncode})')}" for wi in range(n_workers)))
+        # 并行启动各 worker 的调度线程
+        dispatchers = []
+        for w in range(n_workers):
+            t = threading.Thread(target=dispatch_worker, args=(w,), daemon=True)
+            t.start()
+            dispatchers.append(t)
 
-        self.progress_signal.emit(0, f"[Whisper] 全部 {task_num} 个任务已分发, 发送 DONE 信号...")
+        for t in dispatchers:
+            t.join(timeout=3600)
 
-        # 发送 DONE 关闭子进程（先于 reader.join！）
-        for w, proc in enumerate(workers):
-            try:
-                if proc.poll() is None:
-                    proc.stdin.write('DONE\n')
-                    proc.stdin.flush()
-                    self.progress_signal.emit(0, f"[Whisper] Worker{w} DONE 已发送")
-                else:
-                    self.progress_signal.emit(0, f"[Whisper] Worker{w} 已退出, 跳过 DONE")
-            except Exception as e:
-                self.progress_signal.emit(0, f"[Whisper] Worker{w} DONE 发送失败: {str(e)[:80]}")
-
-        # 等待 reader 线程收集完所有结果
-        self.progress_signal.emit(0, f"[Whisper] 等待 stdout reader 完成 (共 {len(readers)} 个)...")
-        for r, reader in enumerate(readers):
-            reader.join(timeout=600)
-            self.progress_signal.emit(0, f"[Whisper] reader{r} 已退出")
-
-        # 清理子进程
+        # 清理
         for proc in workers:
             try:
-                proc.stdin.close()
                 proc.wait(timeout=10)
             except:
                 proc.kill()
 
-        # 诊断：哪些任务没结果
         no_result = [url for url, _ in valid_audio if url not in results]
         if no_result:
-            self.progress_signal.emit(0, f"[Whisper] {len(no_result)}/{total} 个任务无响应 (子进程可能崩溃)")
-            for u in no_result[:10]:
+            self.progress_signal.emit(0, f"[Whisper] {len(no_result)}/{total} 个无响应")
+            for u in no_result[:5]:
                 self.progress_signal.emit(0, f"  无响应: {u[:80]}...")
         else:
             self.progress_signal.emit(0, f"[Whisper] 全部 {total} 个任务均有响应")
